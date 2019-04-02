@@ -46,11 +46,16 @@
 #include "qdbusutil_p.h"
 #include "qcoreapplication.h"
 #include "qcoreevent.h"
+#include "qelapsedtimer.h"
+#include "qloggingcategory.h"
+#include "qthread.h"
 #include <private/qobject_p.h>
 
 #ifndef QT_NO_DBUS
 
 QT_BEGIN_NAMESPACE
+
+Q_LOGGING_CATEGORY(lcBlockingDBus, "qt.dbus.blocking")
 
 /*!
     \class QDBusPendingCall
@@ -232,6 +237,7 @@ void QDBusPendingCallPrivate::checkReceivedSignature()
 
 void QDBusPendingCallPrivate::waitForFinished()
 {
+    QDBusBlockingCallWatcher watcher(sentMessage);
     QMutexLocker locker(&mutex);
 
     if (replyMessage.type() != QDBusMessage::InvalidMessage)
@@ -544,6 +550,85 @@ void QDBusPendingCallWatcher::waitForFinished()
         QCoreApplication::sendPostedEvents(this, QEvent::MetaCall);
     }
 }
+
+// small helper to note long running blocking dbus calls.
+// these are generally a sign of fragile software (too long a call can either
+// lead to bad user experience, if it's running on the GUI thread for instance)
+// or break completely under load (hitting the call timeout).
+//
+// as a result, this is something we want to watch for.
+QDBusBlockingCallWatcher::QDBusBlockingCallWatcher(const QDBusMessage &message)
+    : m_message(message), m_maxCallTimeoutMs(0)
+{
+#if defined(QT_NO_DEBUG)
+    // when in a release build, we default these to off.
+    // this means that we only affect code that explicitly enables the warning.
+    static int mainThreadWarningAmount = -1;
+    static int otherThreadWarningAmount = -1;
+#else
+    static int mainThreadWarningAmount = 200;
+    static int otherThreadWarningAmount = 500;
+#endif
+    static bool initializedAmounts = false;
+    static QBasicMutex initializeMutex;
+    QMutexLocker locker(&initializeMutex);
+
+    if (!initializedAmounts) {
+        int tmp = 0;
+        QByteArray env;
+        bool ok = true;
+
+        env = qgetenv("Q_DBUS_BLOCKING_CALL_MAIN_THREAD_WARNING_MS");
+        if (!env.isEmpty()) {
+            tmp = env.toInt(&ok);
+            if (ok)
+                mainThreadWarningAmount = tmp;
+            else
+                qCWarning(lcBlockingDBus, "Q_DBUS_BLOCKING_CALL_MAIN_THREAD_WARNING_MS must be an integer; value ignored");
+        }
+
+        env = qgetenv("Q_DBUS_BLOCKING_CALL_OTHER_THREAD_WARNING_MS");
+        if (!env.isEmpty()) {
+            tmp = env.toInt(&ok);
+            if (ok)
+                otherThreadWarningAmount = tmp;
+            else
+                qCWarning(lcBlockingDBus, "Q_DBUS_BLOCKING_CALL_OTHER_THREAD_WARNING_MS must be an integer; value ignored");
+        }
+
+        initializedAmounts = true;
+    }
+
+    locker.unlock();
+
+    // if this call is running on the main thread, we have a much lower
+    // tolerance for delay because any long-term delay will wreck user
+    // interactivity.
+    if (qApp && qApp->thread() == QThread::currentThread())
+        m_maxCallTimeoutMs = mainThreadWarningAmount;
+    else
+        m_maxCallTimeoutMs = otherThreadWarningAmount;
+
+    m_callTimer.start();
+}
+
+QDBusBlockingCallWatcher::~QDBusBlockingCallWatcher()
+{
+    qint64 elapsed = m_callTimer.elapsed();
+
+    if (m_maxCallTimeoutMs >= 0 && elapsed >= m_maxCallTimeoutMs) {
+        qCWarning(lcBlockingDBus, "blocking dbus call took a long time (%d ms, max for this thread is %d ms) to service \"%s\" path \"%s\" interface \"%s\" member \"%s\"",
+                 int(elapsed), m_maxCallTimeoutMs,
+                 qPrintable(m_message.service()), qPrintable(m_message.path()),
+                 qPrintable(m_message.interface()), qPrintable(m_message.member()));
+    } else if (lcBlockingDBus().isDebugEnabled()) {
+        qCDebug(lcBlockingDBus, "blocking dbus call on %s thread took %d ms for service \"%s\" path \"%s\" interface \"%s\" member \"%s\"",
+                (qApp->thread() == QThread::currentThread()) ? "main" : "background", int(elapsed),
+                 qPrintable(m_message.service()), qPrintable(m_message.path()),
+                 qPrintable(m_message.interface()), qPrintable(m_message.member()));
+    }
+}
+
 QT_END_NAMESPACE
 
 #endif // QT_NO_DBUS
