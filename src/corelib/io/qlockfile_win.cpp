@@ -110,6 +110,11 @@ QLockFile::LockError QLockFilePrivate::tryLock_sys()
     return error;
 }
 
+bool QLockFilePrivate::isApparentlyStale() const
+{
+    return isInfoApparentlyStale();
+}
+
 bool QLockFilePrivate::removeStaleLock()
 {
     // QFile::remove fails on Windows if the other process is still using the file, so it's not stale.

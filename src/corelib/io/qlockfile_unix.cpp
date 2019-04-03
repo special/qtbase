@@ -133,25 +133,13 @@ static qint64 qt_write_loop(int fd, const char *data, qint64 len)
  * We therefore use only flock(2).
  */
 
-static bool setNativeLocks(int fd)
-{
-#if defined(LOCK_EX) && defined(LOCK_NB)
-    if (flock(fd, LOCK_EX | LOCK_NB) == -1) // other threads, and other processes on a local fs
-        return false;
-#else
-    Q_UNUSED(fd);
-#endif
-    return true;
-}
 
 QLockFile::LockError QLockFilePrivate::tryLock_sys()
 {
     const QByteArray lockFileName = QFile::encodeName(fileName);
-    const int fd = qt_safe_open(lockFileName.constData(), O_RDWR | O_CREAT | O_EXCL, 0666);
+    const int fd = qt_safe_open(lockFileName.constData(), O_RDWR | O_CREAT, 0666);
     if (fd < 0) {
         switch (errno) {
-        case EEXIST:
-            return QLockFile::LockFailedError;
         case EACCES:
         case EROFS:
             return QLockFile::PermissionError;
@@ -159,42 +147,58 @@ QLockFile::LockError QLockFilePrivate::tryLock_sys()
             return QLockFile::UnknownError;
         }
     }
-    // Ensure nobody else can delete the file while we have it
-    if (!setNativeLocks(fd)) {
-        const int errnoSaved = errno;
-        qWarning() << "setNativeLocks failed:" << qt_error_string(errnoSaved);
+
+    // Attempt to acquire an exclusive lock on the file
+    if (flock(fd, LOCK_EX | LOCK_NB) == -1) {
+        switch (errno) {
+        case EWOULDBLOCK:
+            return QLockFile::LockFailedError;
+        default:
+            return QLockFile::UnknownError;
+        }
     }
 
+    // Confirm that the fd still refers to the file at lockFileName. This can fail if the lock
+    // was released (and the file removed) between the open and flock calls above; in that case,
+    // a lock was just acquired on a meaningless unnamed file. The right behavior is to simply
+    // try again, creating the file if necessary.
+    QT_STATBUF statOpen, statFile;
+    if (QT_FSTAT(fd, &statOpen) == -1 || QT_STAT(lockFileName.constData(), &statFile) == -1) {
+        switch (errno) {
+        case ENOENT:
+            return QLockFile::LockFailedError;
+        default:
+            return QLockFile::UnknownError;
+        }
+    }
+    if (statOpen.st_dev != statFile.st_dev || statOpen.st_ino != statFile.st_ino)
+        return QLockFile::LockFailedError;
+
+    // The contents of the file are basically pointless; there is no possibility of a stale
+    // lock with flock().
     QByteArray fileData = lockFileContents();
-    if (qt_write_loop(fd, fileData.constData(), fileData.size()) < fileData.size()) {
-        qt_safe_close(fd);
+    if (QT_FTRUNCATE(fd, 0) == -1 ||
+        qt_write_loop(fd, fileData.constData(), fileData.size()) < fileData.size()) {
         if (!QFile::remove(fileName))
             qWarning("QLockFile: Could not remove our own lock file %s.", qPrintable(fileName));
+        qt_safe_close(fd);
         return QLockFile::UnknownError; // partition full
     }
 
     // We hold the lock, continue.
     fileHandle = fd;
-
-    // Sync to disk if possible. Ignore errors (e.g. not supported).
-#if defined(_POSIX_SYNCHRONIZED_IO) && _POSIX_SYNCHRONIZED_IO > 0
-    fdatasync(fileHandle);
-#else
-    fsync(fileHandle);
-#endif
-
     return QLockFile::NoError;
+}
+
+bool QLockFilePrivate::isApparentlyStale() const
+{
+    // Stale locks cannot exist when relying on flock
+    return false;
 }
 
 bool QLockFilePrivate::removeStaleLock()
 {
-    const QByteArray lockFileName = QFile::encodeName(fileName);
-    const int fd = qt_safe_open(lockFileName.constData(), O_WRONLY, 0666);
-    if (fd < 0) // gone already?
-        return false;
-    bool success = setNativeLocks(fd) && (::unlink(lockFileName) == 0);
-    close(fd);
-    return success;
+    return true;
 }
 
 bool QLockFilePrivate::isProcessRunning(qint64 pid, const QString &appname)
@@ -277,12 +281,11 @@ void QLockFile::unlock()
     Q_D(QLockFile);
     if (!d->isLocked)
         return;
-    close(d->fileHandle);
-    d->fileHandle = -1;
     if (!QFile::remove(d->fileName)) {
         qWarning() << "Could not remove our own lock file" << d->fileName << "maybe permissions changed meanwhile?";
-        // This is bad because other users of this lock file will now have to wait for the stale-lock-timeout...
     }
+    close(d->fileHandle);
+    d->fileHandle = -1;
     d->lockError = QLockFile::NoError;
     d->isLocked = false;
 }

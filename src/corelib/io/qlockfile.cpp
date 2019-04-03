@@ -272,7 +272,7 @@ bool QLockFile::tryLock(int timeout)
             sleepTime = remainingTime;
 
         QThread::msleep(sleepTime);
-        if (sleepTime < 5 * 1000)
+        if (sleepTime < 2 * 1000)
             sleepTime *= 2;
     }
     // not reached
@@ -368,7 +368,7 @@ static bool getLockInfo_helper(const QString &fileName, LockFileInfo *info)
     return ok && info->pid > 0;
 }
 
-bool QLockFilePrivate::isApparentlyStale() const
+bool QLockFilePrivate::isInfoApparentlyStale() const
 {
     LockFileInfo info;
     if (getLockInfo_helper(fileName, &info)) {
