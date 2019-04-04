@@ -49,6 +49,7 @@
 #include <qstringlist.h>
 #include <qtimer.h>
 #include <qthread.h>
+#include <qloggingcategory.h>
 
 #include "qdbusargument.h"
 #include "qdbusconnection_p.h"
@@ -76,6 +77,8 @@
 #ifndef QT_NO_DBUS
 
 QT_BEGIN_NAMESPACE
+
+Q_LOGGING_CATEGORY(lcBlockingDBus, "qt.dbus.blocking")
 
 // used with dbus_server_allocate_data_slot
 static dbus_int32_t server_slot = -1;
@@ -1990,7 +1993,7 @@ public:
                 if (ok)
                     mainThreadWarningAmount = tmp;
                 else
-                    qWarning("QDBusBlockingCallWatcher: Q_DBUS_BLOCKING_CALL_MAIN_THREAD_WARNING_MS must be an integer; value ignored");
+                    qCWarning(lcBlockingDBus, "Q_DBUS_BLOCKING_CALL_MAIN_THREAD_WARNING_MS must be an integer; value ignored");
             }
 
             env = qgetenv("Q_DBUS_BLOCKING_CALL_OTHER_THREAD_WARNING_MS");
@@ -1999,7 +2002,7 @@ public:
                 if (ok)
                     otherThreadWarningAmount = tmp;
                 else
-                    qWarning("QDBusBlockingCallWatcher: Q_DBUS_BLOCKING_CALL_OTHER_THREAD_WARNING_MS must be an integer; value ignored");
+                    qCWarning(lcBlockingDBus, "Q_DBUS_BLOCKING_CALL_OTHER_THREAD_WARNING_MS must be an integer; value ignored");
             }
 
             initializedAmounts = true;
@@ -2020,12 +2023,16 @@ public:
 
     ~QDBusBlockingCallWatcher()
     {
-        if (m_maxCallTimeoutMs < 0)
-            return; // disabled
+        qint64 elapsed = m_callTimer.elapsed();
 
-        if (m_callTimer.elapsed() >= m_maxCallTimeoutMs) {
-            qWarning("QDBusConnection: warning: blocking call took a long time (%d ms, max for this thread is %d ms) to service \"%s\" path \"%s\" interface \"%s\" member \"%s\"",
-                     int(m_callTimer.elapsed()), m_maxCallTimeoutMs,
+        if (m_maxCallTimeoutMs >= 0 && elapsed >= m_maxCallTimeoutMs) {
+            qCWarning(lcBlockingDBus, "blocking dbus call took a long time (%d ms, max for this thread is %d ms) to service \"%s\" path \"%s\" interface \"%s\" member \"%s\"",
+                     int(elapsed), m_maxCallTimeoutMs,
+                     qPrintable(m_message.service()), qPrintable(m_message.path()),
+                     qPrintable(m_message.interface()), qPrintable(m_message.member()));
+        } else if (lcBlockingDBus.isDebugEnabled()) {
+            qCDebug(lcBlockingDBus, "blocking dbus call on %s thread took %d ms for service \"%s\" path \"%s\" interface \"%s\" member \"%s\"",
+                    (qApp->thread() == QThread::currentThread()) ? "main" : "background", int(elapsed),
                      qPrintable(m_message.service()), qPrintable(m_message.path()),
                      qPrintable(m_message.interface()), qPrintable(m_message.member()));
         }
