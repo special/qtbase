@@ -247,7 +247,7 @@ bool QLockFile::tryLock(int timeout)
             sleepTime = remainingTime;
 
         QThread::msleep(sleepTime);
-        if (sleepTime < 5 * 1000)
+        if (sleepTime < 2 * 1000)
             sleepTime *= 2;
     }
     // not reached

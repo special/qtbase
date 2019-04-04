@@ -94,82 +94,6 @@ static qint64 qt_write_loop(int fd, const char *data, qint64 len)
     return pos;
 }
 
-int QLockFilePrivate::checkFcntlWorksAfterFlock(const QString &fn)
-{
-#ifndef QT_NO_TEMPORARYFILE
-    QTemporaryFile file(fn);
-    if (!file.open())
-        return 0;
-    const int fd = file.d_func()->engine()->handle();
-#if defined(LOCK_EX) && defined(LOCK_NB)
-    if (flock(fd, LOCK_EX | LOCK_NB) == -1) // other threads, and other processes on a local fs
-        return 0;
-#endif
-    struct flock flockData;
-    flockData.l_type = F_WRLCK;
-    flockData.l_whence = SEEK_SET;
-    flockData.l_start = 0;
-    flockData.l_len = 0; // 0 = entire file
-    flockData.l_pid = getpid();
-    if (fcntl(fd, F_SETLK, &flockData) == -1) // for networked filesystems
-        return 0;
-    return 1;
-#else
-    Q_UNUSED(fn);
-    return 0;
-#endif
-}
-
-// Cache the result of checkFcntlWorksAfterFlock for each directory a lock
-// file is created in because in some filesystems, like NFS, both locks
-// are the same.  This does not take into account a filesystem changing.
-// QCache is set to hold a maximum of 10 entries, this is to avoid unbounded
-// growth, this is caching directories of files and it is assumed a low number
-// will be sufficient.
-typedef QCache<QString, bool> CacheType;
-Q_GLOBAL_STATIC_WITH_ARGS(CacheType, fcntlOK, (10));
-static QBasicMutex fcntlLock;
-
-/*!
-  \internal
-  Checks that the OS isn't using POSIX locks to emulate flock().
-  \macos is one of those.
-*/
-static bool fcntlWorksAfterFlock(const QString &fn)
-{
-    QMutexLocker lock(&fcntlLock);
-    if (fcntlOK.isDestroyed())
-        return QLockFilePrivate::checkFcntlWorksAfterFlock(fn);
-    bool *worksPtr = fcntlOK->object(fn);
-    if (worksPtr)
-        return *worksPtr;
-
-    const bool val = QLockFilePrivate::checkFcntlWorksAfterFlock(fn);
-    worksPtr = new bool(val);
-    fcntlOK->insert(fn, worksPtr);
-
-    return val;
-}
-
-static bool setNativeLocks(const QString &fileName, int fd)
-{
-#if defined(LOCK_EX) && defined(LOCK_NB)
-    if (flock(fd, LOCK_EX | LOCK_NB) == -1) // other threads, and other processes on a local fs
-        return false;
-#endif
-    struct flock flockData;
-    flockData.l_type = F_WRLCK;
-    flockData.l_whence = SEEK_SET;
-    flockData.l_start = 0;
-    flockData.l_len = 0; // 0 = entire file
-    flockData.l_pid = getpid();
-    if (fcntlWorksAfterFlock(QDir::cleanPath(QFileInfo(fileName).absolutePath()) + QString('/'))
-        && fcntl(fd, F_SETLK, &flockData) == -1) { // for networked filesystems
-        return false;
-    }
-    return true;
-}
-
 QLockFile::LockError QLockFilePrivate::tryLock_sys()
 {
     // Assemble data, to write in a single call to write
@@ -180,11 +104,9 @@ QLockFile::LockError QLockFilePrivate::tryLock_sys()
                           % QSysInfo::machineHostName().toUtf8() % '\n';
 
     const QByteArray lockFileName = QFile::encodeName(fileName);
-    const int fd = qt_safe_open(lockFileName.constData(), O_WRONLY | O_CREAT | O_EXCL, 0666);
+    const int fd = qt_safe_open(lockFileName.constData(), O_RDWR | O_CREAT, 0666);
     if (fd < 0) {
         switch (errno) {
-        case EEXIST:
-            return QLockFile::LockFailedError;
         case EACCES:
         case EROFS:
             return QLockFile::PermissionError;
@@ -192,63 +114,57 @@ QLockFile::LockError QLockFilePrivate::tryLock_sys()
             return QLockFile::UnknownError;
         }
     }
-    // Ensure nobody else can delete the file while we have it
-    if (!setNativeLocks(fileName, fd)) {
-        const int errnoSaved = errno;
-        qWarning() << "setNativeLocks failed:" << qt_error_string(errnoSaved);
+
+    // Attempt to acquire an exclusive lock on the file
+    if (flock(fd, LOCK_EX | LOCK_NB) == -1) {
+        switch (errno) {
+        case EWOULDBLOCK:
+            return QLockFile::LockFailedError;
+        default:
+            return QLockFile::UnknownError;
+        }
     }
 
-    if (qt_write_loop(fd, fileData.constData(), fileData.size()) < fileData.size()) {
-        close(fd);
+    // Confirm that the fd still refers to the file at lockFileName. This can fail if the lock
+    // was released (and the file removed) between the open and flock calls above; in that case,
+    // a lock was just acquired on a meaningless unnamed file. The right behavior is to simply
+    // try again, creating the file if necessary.
+    QT_STATBUF statOpen, statFile;
+    if (QT_FSTAT(fd, &statOpen) == -1 || QT_STAT(lockFileName.constData(), &statFile) == -1) {
+        switch (errno) {
+        case ENOENT:
+            return QLockFile::LockFailedError;
+        default:
+            return QLockFile::UnknownError;
+        }
+    }
+    if (statOpen.st_dev != statFile.st_dev || statOpen.st_ino != statFile.st_ino)
+        return QLockFile::LockFailedError;
+
+    // The contents of the file are basically pointless; there is no possibility of a stale
+    // lock with flock().
+    if (QT_FTRUNCATE(fd, 0) == -1 ||
+        qt_write_loop(fd, fileData.constData(), fileData.size()) < fileData.size()) {
         if (!QFile::remove(fileName))
             qWarning("QLockFile: Could not remove our own lock file %s.", qPrintable(fileName));
+        qt_safe_close(fd);
         return QLockFile::UnknownError; // partition full
     }
 
     // We hold the lock, continue.
     fileHandle = fd;
-
-    // Sync to disk if possible. Ignore errors (e.g. not supported).
-#if defined(_POSIX_SYNCHRONIZED_IO) && _POSIX_SYNCHRONIZED_IO > 0
-    fdatasync(fileHandle);
-#else
-    fsync(fileHandle);
-#endif
-
     return QLockFile::NoError;
-}
-
-bool QLockFilePrivate::removeStaleLock()
-{
-    const QByteArray lockFileName = QFile::encodeName(fileName);
-    const int fd = qt_safe_open(lockFileName.constData(), O_WRONLY, 0666);
-    if (fd < 0) // gone already?
-        return false;
-    bool success = setNativeLocks(fileName, fd) && (::unlink(lockFileName) == 0);
-    close(fd);
-    return success;
 }
 
 bool QLockFilePrivate::isApparentlyStale() const
 {
-    qint64 pid;
-    QString hostname, appname;
-    if (getLockInfo(&pid, &hostname, &appname)) {
-        if (hostname.isEmpty() || hostname == QSysInfo::machineHostName()) {
-            if (::kill(pid, 0) == -1 && errno == ESRCH)
-                return true; // PID doesn't exist anymore
-            const QString processName = processNameByPid(pid);
-            if (!processName.isEmpty()) {
-                QFileInfo fi(appname);
-                if (fi.isSymLink())
-                    fi.setFile(fi.symLinkTarget());
-                if (processName != fi.fileName())
-                    return true; // PID got reused by a different application.
-            }
-        }
-    }
-    const qint64 age = QFileInfo(fileName).lastModified().msecsTo(QDateTime::currentDateTime());
-    return staleLockTime > 0 && qAbs(age) > staleLockTime;
+    // Stale locks cannot exist when relying on flock
+    return false;
+}
+
+bool QLockFilePrivate::removeStaleLock()
+{
+    return true;
 }
 
 QString QLockFilePrivate::processNameByPid(qint64 pid)
@@ -314,12 +230,11 @@ void QLockFile::unlock()
     Q_D(QLockFile);
     if (!d->isLocked)
         return;
-    close(d->fileHandle);
-    d->fileHandle = -1;
     if (!QFile::remove(d->fileName)) {
         qWarning() << "Could not remove our own lock file" << d->fileName << "maybe permissions changed meanwhile?";
-        // This is bad because other users of this lock file will now have to wait for the stale-lock-timeout...
     }
+    close(d->fileHandle);
+    d->fileHandle = -1;
     d->lockError = QLockFile::NoError;
     d->isLocked = false;
 }
