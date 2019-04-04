@@ -2509,6 +2509,7 @@ QString QDBusConnectionPrivate::getNameOwnerNoCache(const QString &serviceName)
     QDBusMessagePrivate::setParametersValidated(msg, true);
     msg << serviceName;
 
+    QDBusBlockingCallWatcher watcher(msg);
     QDBusPendingCallPrivate *pcall = sendWithReplyAsync(msg, Q_NULLPTR, Q_NULLPTR, Q_NULLPTR);
     if (thread() == QThread::currentThread()) {
         // this function may be called in our own thread and
