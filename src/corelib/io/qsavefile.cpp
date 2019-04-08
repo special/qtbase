@@ -302,8 +302,10 @@ bool QSaveFile::commit()
     }
     QFileDevice::close(); // calls flush()
 
+#if 0
     // Sync to disk if possible. Ignore errors (e.g. not supported).
     d->fileEngine->syncToDisk();
+#endif
 
     if (d->useTemporaryFile) {
         if (d->writeError != QFileDevice::NoError) {
