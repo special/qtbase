@@ -59,6 +59,7 @@
 #include <qvector.h>
 #include <qmutex.h>
 #include <qwaitcondition.h>
+#include <qelapsedtimer.h>
 
 #include "qdbusmessage.h"
 #include "qdbus_symbols_p.h"
@@ -129,6 +130,18 @@ Q_SIGNALS:
     void finished();
     void reply(const QDBusMessage &msg);
     void error(const QDBusError &error, const QDBusMessage &msg);
+};
+
+class QDBusBlockingCallWatcher
+{
+public:
+    QDBusBlockingCallWatcher(const QDBusMessage &message);
+    ~QDBusBlockingCallWatcher();
+
+private:
+    QDBusMessage m_message;
+    int m_maxCallTimeoutMs;
+    QElapsedTimer m_callTimer;
 };
 
 QT_END_NAMESPACE
